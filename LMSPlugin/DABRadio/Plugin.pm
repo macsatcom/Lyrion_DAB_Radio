@@ -74,6 +74,7 @@ sub handleFeed {
                         type => 'audio',
                         name => $svc->{name},
                         url  => $url,
+                        icon => 'plugins/DABRadio/html/images/LyrionDABRadio_svg.png',
                     };
                 }
                 push @items, {
