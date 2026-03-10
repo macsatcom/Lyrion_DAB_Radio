@@ -1,20 +1,23 @@
 package Plugins::DABRadio::Settings;
 
 use strict;
-use warnings;
 use base qw(Slim::Web::Settings);
 
 use Slim::Utils::Prefs;
-use Slim::Web::HTTP::CSRF;
 
 my $prefs = preferences('plugin.dabradio');
 
-Slim::Web::HTTP::CSRF->protectName('dabradio_settings');
-Slim::Web::HTTP::CSRF->protectURI('/plugins/dabradio/settings/basic.html');
+sub name {
+    return Slim::Web::HTTP::CSRF->protectName('PLUGIN_DABRADIO_MODULE_NAME');
+}
 
-sub name   { return 'PLUGIN_DABRADIO_SETTINGS'; }
-sub page   { return 'plugins/DABRadio/settings/basic.html'; }
-sub prefs  { return ($prefs, qw(daemon_url icecast_host icecast_port)); }
+sub page {
+    return Slim::Web::HTTP::CSRF->protectURI('plugins/DABRadio/settings/basic.html');
+}
+
+sub prefs {
+    return ($prefs, qw(daemon_url icecast_host icecast_port));
+}
 
 sub handler {
     my ($class, $client, $params) = @_;

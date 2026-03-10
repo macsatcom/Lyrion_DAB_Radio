@@ -34,6 +34,10 @@ PLUGIN_DABRADIO_ICECAST_PORT_DESC
 	EN	Icecast port number (default: 8000)
 	DA	Icecast portnummer (standard: 8000)
 
+PLUGIN_DABRADIO_NO_SERVICES
+	EN	No services found — check daemon URL in settings
+	DA	Ingen tjenester fundet — tjek daemon URL i indstillinger
+
 PLUGIN_DABRADIO_SAVE
 	EN	Save
 	DA	Gem

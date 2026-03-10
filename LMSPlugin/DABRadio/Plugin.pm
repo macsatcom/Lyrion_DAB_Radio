@@ -1,26 +1,34 @@
 package Plugins::DABRadio::Plugin;
 
 use strict;
-use warnings;
+
+use vars qw($VERSION);
 use base qw(Slim::Plugin::OPMLBased);
+
+use Plugins::DABRadio::Settings;
 
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
 use Slim::Utils::Strings qw(string);
-use JSON::XS::VersionOneAndTwo;
-use LWP::UserAgent;
 
-my $log   = Slim::Utils::Log->addLogCategory({ 'category' => 'plugin.dabradio' });
+$VERSION = '1.0';
+
+my $log = Slim::Utils::Log->addLogCategory({
+    'category'     => 'plugin.dabradio',
+    'defaultLevel' => 'WARN',
+    'description'  => 'DAB Radio Plugin',
+});
+
 my $prefs = preferences('plugin.dabradio');
+
+$prefs->init({
+    daemon_url   => 'http://localhost:9980',
+    icecast_host => '',
+    icecast_port => 8000,
+});
 
 sub initPlugin {
     my $class = shift;
-
-    $prefs->init({
-        daemon_url    => 'http://your-dab-server:8080',   # <-- set in plugin settings
-        icecast_host  => 'your-icecast-host',             # <-- set in plugin settings
-        icecast_port  => 8000,
-    });
 
     Plugins::DABRadio::Settings->new();
 
@@ -28,97 +36,61 @@ sub initPlugin {
         feed   => \&handleFeed,
         tag    => 'dabradio',
         menu   => 'radios',
-        is_app => 1,
-        weight => 1,
+        weight => 10,
     );
 }
 
-sub getDisplayName { return 'PLUGIN_DABRADIO_MODULE_NAME'; }
+sub getDisplayName {
+    return 'PLUGIN_DABRADIO_MODULE_NAME';
+}
 
 sub handleFeed {
-    my ($client, $callback, $args) = @_;
+    my ($client, $cb, $args) = @_;
 
     my $daemon_url   = $prefs->get('daemon_url')   || '';
     my $icecast_host = $prefs->get('icecast_host') || '';
     my $icecast_port = $prefs->get('icecast_port') || 8000;
 
-    # ── Fetch MUX list from daemon ──────────────────────────────────────────
-    my $muxes = _fetch_muxes($daemon_url);
+    Slim::Networking::SimpleAsyncHTTP->new(
+        sub {
+            my $http  = shift;
+            my $muxes = eval { JSON::XS::decode_json($http->content) };
 
-    unless ($muxes && @$muxes) {
-        $callback->({
-            type  => 'opml',
-            title => string('PLUGIN_DABRADIO_MODULE_NAME'),
-            items => [{
-                type  => 'text',
-                name  => 'Could not reach DAB daemon at: ' . $daemon_url,
-            }],
-        });
-        return;
-    }
-
-    # ── Build OPML tree: MUX → Services ────────────────────────────────────
-    my @mux_items;
-
-    for my $mux (@$muxes) {
-        my @service_items;
-
-        for my $svc (@{ $mux->{services} || [] }) {
-            # Build stream URL using icecast host/port + mount from daemon
-            my $stream_url = $svc->{stream};
-
-            # Override host/port with locally configured values if set
-            if ($icecast_host && $icecast_host ne 'your-icecast-host') {
-                (my $mount = $stream_url) =~ s|^https?://[^/]+||;
-                $stream_url = "http://$icecast_host:$icecast_port$mount";
+            if ($@ || !$muxes || !@$muxes) {
+                $cb->({ items => [{ type => 'text', name => string('PLUGIN_DABRADIO_NO_SERVICES') }] });
+                return;
             }
 
-            push @service_items, {
-                type  => 'audio',
-                name  => $svc->{name},
-                url   => $stream_url,
-                icon  => 'plugins/DABRadio/html/images/DABRadio.png',
-            };
-        }
+            my @items;
+            for my $mux (@$muxes) {
+                my @svc_items;
+                for my $svc (@{ $mux->{services} || [] }) {
+                    my $url = $svc->{stream};
+                    if ($icecast_host) {
+                        (my $mount = $url) =~ s|^https?://[^/]+||;
+                        $url = "http://$icecast_host:$icecast_port$mount";
+                    }
+                    push @svc_items, {
+                        type => 'audio',
+                        name => $svc->{name},
+                        url  => $url,
+                    };
+                }
+                push @items, {
+                    type  => 'outline',
+                    name  => $mux->{name},
+                    items => \@svc_items,
+                };
+            }
 
-        # Add a "Switch to this MUX" action at the top of each MUX group
-        unshift @service_items, {
-            type => 'text',
-            name => 'Freq: ' . $mux->{freq_mhz} . ' MHz  |  '
-                  . scalar(@{ $mux->{services} || [] }) . ' services',
-        };
-
-        push @mux_items, {
-            type  => 'outline',
-            name  => $mux->{name},
-            items => \@service_items,
-        };
-    }
-
-    $callback->({
-        type  => 'opml',
-        title => string('PLUGIN_DABRADIO_MODULE_NAME'),
-        items => \@mux_items,
-    });
-}
-
-# ── Fetch MUX list from daemon's /muxes endpoint ───────────────────────────
-
-sub _fetch_muxes {
-    my $base = shift;
-    return undef unless $base;
-
-    eval {
-        my $ua = LWP::UserAgent->new(timeout => 3);
-        my $resp = $ua->get("$base/muxes");
-        if ($resp->is_success) {
-            return decode_json($resp->decoded_content);
-        }
-    };
-    if ($@) {
-        $log->warn("DAB daemon fetch failed: $@");
-    }
-    return undef;
+            $cb->({ items => \@items });
+        },
+        sub {
+            $log->warn('DAB daemon fetch failed: ' . $_[1]);
+            $cb->({ items => [{ type => 'text', name => 'Could not reach DAB daemon at: ' . $daemon_url }] });
+        },
+        { timeout => 5 },
+    )->get("$daemon_url/muxes");
 }
 
 1;
