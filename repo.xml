@@ -1,15 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <extensions>
     <details>
-        <title>DAB Radio via RTL-SDR</title>
+        <title lang="EN">DAB Radio via RTL-SDR</title>
     </details>
     <plugins>
         <plugin name="DABRadio" version="1.0" minTarget="7.6" maxTarget="*">
-            <title>DAB Radio</title>
-            <desc>DAB+ radio reception via RTL-SDR and welle-cli</desc>
-            <url>https://github.com/macsatcom/Lyrion_DAB_Radio/archive/refs/heads/main.zip</url>
+            <title lang="EN">DAB Radio</title>
+            <desc lang="EN">DAB+ radio reception via RTL-SDR and welle-cli</desc>
+            <url>https://github.com/macsatcom/Lyrion_DAB_Radio/releases/download/plugin-v1.0/DABRadio-1.0.zip</url>
             <link>https://github.com/macsatcom/Lyrion_DAB_Radio</link>
-            <creator>Your Name</creator>
+            <sha>b559226900d6164ca5d36d0d00c5b06360270d38</sha>
+            <creator>Kasper S Nielsen</creator>
+            <creatorEmail>kasper@smsweb.dk</creatorEmail>
         </plugin>
     </plugins>
 </extensions>

@@ -1,8 +1,11 @@
-# lms-dab-radio
+# Lyrion_DAB_Radio
+Stream DAB+ radio to Lyrion Music Server via RTL-SDR
 
 DAB+ radio reception via RTL-SDR for Lyrion Music Server (LMS).
 
-Uses `welle-cli` to receive and decode a full DAB multiplex, and streams each service permanently to Icecast via ffmpeg. An LMS plugin displays all services grouped by MUX with live metadata (current song, genre).
+Receives a full DAB multiplex using [welle-cli](https://github.com/AlbrechtL/welle.io), decodes all services simultaneously, streams each to a permanent Icecast mount with live metadata, and exposes an HTTP API for service discovery and MUX switching. An LMS plugin integrates it into the Radio menu as a flat station list.
+
+![DAB Radio plugin icon](LMSPlugin/DABRadio/HTML/EN/plugins/DABRadio/html/images/LyrionDABRadio_svg.png)
 
 ---
 
@@ -12,22 +15,22 @@ Uses `welle-cli` to receive and decode a full DAB multiplex, and streams each se
 RTL-SDR dongle
       ↓
   welle-cli -c 11C -Dw 9090   (decodes all services, serves MP3 over HTTP)
-      ↓ http://localhost:9090/mp3/<SID>   (one per audio service)
+      ↓ http://localhost:9090/mp3/<SID>   (one stream per audio service)
   ffmpeg → Icecast /dab/dr-p1
   ffmpeg → Icecast /dab/dr-p2
   ffmpeg → Icecast /dab/dr-p3
   ...one ffmpeg per service...
       ↑
-  dab-daemon  (HTTP API — service discovery, MUX switching, DLS metadata)
+  dab-daemon  (HTTP API — service discovery, MUX switching, live metadata)
       ↑
-  LMS Plugin  (Radio menu, grouped by MUX, live stream URLs)
+  LMS Plugin  (Radio menu, flat station list)
 ```
 
-**Service discovery:** welle-cli scans the MUX automatically. No manual SID configuration needed — services are discovered at startup and cached.
+**Service discovery:** welle-cli scans the MUX automatically. No manual SID or frequency configuration needed — all services are discovered at startup and cached.
 
-**Live metadata:** the daemon polls welle-cli every 10 seconds for DLS (Dynamic Label Service) updates and pushes current song, genre, and description to Icecast.
+**Live metadata:** the daemon polls welle-cli every 10 seconds for DLS (Dynamic Label Service) updates and pushes current song, genre, and description to each Icecast mount.
 
-**No startup latency for listeners:** all services stream to Icecast permanently. Selecting a station in LMS just connects to its Icecast mount — instant playback.
+**Resilience:** a watchdog thread monitors ffmpeg processes and automatically restarts any that die.
 
 ---
 
@@ -35,64 +38,52 @@ RTL-SDR dongle
 
 - Linux server (Debian/Ubuntu recommended)
 - RTL-SDR USB dongle connected and working
-- `welle-cli` built from [welle.io](https://github.com/AlbrechtL/welle.io):
-  ```bash
-  sudo apt install cmake librtlsdr-dev libfftw3-dev libfaad-dev libmpg123-dev libmp3lame-dev
-  git clone https://github.com/AlbrechtL/welle.io
-  cd welle.io && mkdir build && cd build
-  cmake -DBUILD_WELLE_CLI=ON -DBUILD_GUI_APP=OFF ..
-  make -j$(nproc)
-  sudo cp src/welle-cli/welle-cli /usr/local/bin/
-  ```
-- `ffmpeg` installed: `sudo apt install ffmpeg`
-- Icecast2 running (local install or Docker)
+- [welle-cli](https://github.com/AlbrechtL/welle.io) built and installed (see note below)
+- `ffmpeg` installed (`apt install ffmpeg`)
+- Icecast2 server running (`apt install icecast2` or Docker)
 - Lyrion Music Server 8.x or 9.x
 
-### Verify reception
+### RTL-SDR USB dongle
 
-Before configuring the daemon, confirm welle-cli can receive your MUX:
+RTL-SDR is a type of software-defined radio (SDR) that uses a cheap DVB-T TV tuner dongle as a wideband radio receiver. Originally designed for receiving digital TV, these dongles can be repurposed to receive a wide range of radio signals — including DAB+ — when used with the right software. A basic dongle from China costing around 10 EUR works perfectly fine for DAB reception.
+
+> **Note:** Getting your RTL-SDR dongle working and building welle-cli is outside the scope of this guide. See the [rtl-sdr quickstart](https://www.rtl-sdr.com/rtl-sdr-quick-start-guide/) and the [welle.io README](https://github.com/AlbrechtL/welle.io) for instructions. Verify your setup works by running `welle-cli -c 11C -s any` before proceeding.
+
+### Building welle-cli
 
 ```bash
-welle-cli -c 11C -s any 2>&1 | head -20
-# Should show: "Wait for service list" followed by TII data
+sudo apt install cmake librtlsdr-dev libfftw3-dev libfaad-dev libmpg123-dev libmp3lame-dev
+git clone https://github.com/AlbrechtL/welle.io
+cd welle.io && mkdir build && cd build
+cmake -DBUILD_WELLE_CLI=ON -DBUILD_GUI_APP=OFF ..
+make -j$(nproc)
+sudo cp src/welle-cli/welle-cli /usr/local/bin/
 ```
-
----
-
-## Finding your DAB channel
-
-You only need the channel name (e.g. `11C`), not frequencies or SIDs — welle-cli handles discovery automatically.
-
-**Common Danish MUX channels:**
-| MUX | Channel | Frequency |
-|-----|---------|-----------|
-| DR MUX | 11C | 220.352 MHz |
-| Lokal DAB | 10B | 212.928 MHz |
-
-For other countries, see the [ETSI DAB channel table](https://www.etsi.org/technologies/dab).
 
 ---
 
 ## Daemon Setup
 
+The daemon (`dab-daemon.py`) manages welle-cli and ffmpeg pipelines, and exposes an HTTP API for service discovery and MUX switching.
+
 ### 1. Configure
 
-Edit `daemon/dab-daemon.py` and fill in your values:
+Edit `daemon/dab-daemon.py` and fill in the configuration section at the top:
 
 ```python
 WELLE_CLI_BIN      = "/usr/local/bin/welle-cli"
-WELLE_PORT         = 9090          # internal port for welle-cli HTTP — not exposed
+WELLE_PORT         = 9090              # internal welle-cli HTTP port (not exposed)
 
 ICECAST_HOST       = "your-icecast-host"
 ICECAST_PORT       = 8000
 ICECAST_SOURCE     = "your-source-password"
 ICECAST_ADMIN_USER = "admin"
-ICECAST_ADMIN_PASS = "your-admin-password"  # used as fallback for metadata auth
+ICECAST_ADMIN_PASS = "your-admin-password"
 
 DAEMON_PORT        = 9980
 ```
 
-Define your MUX list — one entry per DAB multiplex you want to receive:
+And define your MUX list:
 
 ```python
 MUX_LIST = [
@@ -101,15 +92,10 @@ MUX_LIST = [
         "name":    "DR MUX (11C)",
         "channel": "11C",
     },
-    # { "key": "mux2", "name": "Lokal DAB (10B)", "channel": "10B" },
 ]
 ```
 
-Optionally configure where to store the service cache:
-
-```python
-SERVICES_CACHE = "/var/lib/dab-daemon/services.json"
-```
+Optionally create the service cache directory:
 
 ```bash
 sudo mkdir -p /var/lib/dab-daemon
@@ -132,7 +118,8 @@ sudo systemctl enable dab-daemon
 sudo systemctl start dab-daemon
 ```
 
-Check status and logs:
+Check that it is running:
+
 ```bash
 sudo systemctl status dab-daemon
 journalctl -u dab-daemon -f
@@ -147,11 +134,11 @@ curl http://localhost:9980/status
 # List discovered MUXes and services
 curl http://localhost:9980/muxes
 
-# Force rescan of current MUX
-curl http://localhost:9980/rescan
-
 # Switch to a different MUX
 curl http://localhost:9980/switch/mux2
+
+# Force rescan of current MUX
+curl http://localhost:9980/rescan
 
 # Stop everything
 curl -X POST http://localhost:9980/stop
@@ -163,7 +150,7 @@ curl -X POST http://localhost:9980/stop
 |--------|------|-------------|
 | GET | `/status` | Current MUX, welle-cli state, and all active stream URLs |
 | GET | `/muxes` | List all MUXes with discovered services and Icecast stream URLs |
-| GET | `/switch/<key>` | Switch to MUX by key (async, ~15-30 s for discovery) |
+| GET | `/switch/<key>` | Switch to MUX by key (async, ~15–30 s for discovery) |
 | POST | `/switch?mux=<key>` | Switch to MUX by key |
 | GET | `/rescan` | Force rescan of current MUX (clears cache) |
 | POST | `/stop` | Stop all ffmpeg pipelines and welle-cli |
@@ -174,49 +161,31 @@ curl -X POST http://localhost:9980/stop
 
 ### Manual install
 
-Copy `LMSPlugin/DABRadio` to your LMS plugin directory:
-- Docker: `/config/cache/Plugins/DABRadio`
-- Standard: `/usr/share/squeezeboxserver/Plugins/DABRadio`
+1. Copy the `LMSPlugin/DABRadio` folder into your LMS plugin directory:
+   - Docker: `/config/cache/Plugins/DABRadio`
+   - Standard: `/usr/share/squeezeboxserver/Plugins/DABRadio`
 
-Restart LMS.
+2. Restart LMS.
+
+### Via external repository
+
+Add the following URL in LMS under **Settings → Plugins → Add repository**:
+
+```
+https://raw.githubusercontent.com/macsatcom/Lyrion_DAB_Radio/main/repo.xml
+```
+
+After adding the repository, DAB Radio will appear in the plugin list and can be installed from there.
 
 ### Plugin configuration
 
-Go to **Settings → Plugins → DAB Radio → Settings**:
+After installation, go to **Settings → Plugins → DAB Radio → Settings** and configure:
 
-- **Daemon URL** — e.g. `http://192.168.1.50:9980`
-- **Icecast Host** — hostname or IP of your Icecast server
+- **Daemon URL** — URL to your dab-daemon, e.g. `http://192.168.1.10:9980`
+- **Icecast Host** — hostname or IP of your Icecast server (leave blank to use URLs from daemon)
 - **Icecast Port** — typically `8000`
 
-The plugin appears under **Radio → DAB Radio** in LMS. Services are grouped by MUX. Selecting a service connects directly to its permanent Icecast stream.
-
----
-
-## MUX Switching
-
-When you switch MUX via the API, the daemon:
-1. Stops all ffmpeg pipelines
-2. Restarts welle-cli on the new channel
-3. Waits up to 30 seconds for service discovery
-4. Starts new ffmpeg pipelines for all discovered audio services
-
-The LMS plugin always queries `/muxes` for the current service list, so after a switch the station list updates on next browse.
-
----
-
-## Metadata
-
-The daemon pushes three types of metadata to each Icecast mount:
-
-| Field | Source | Example |
-|-------|--------|---------|
-| Stream name | Service label from DAB | `DR P1` |
-| Genre | DAB Programme Type (PTY) | `Talk`, `Pop Music`, `Jazz and Blues` |
-| Current song | DLS (Dynamic Label Service) | `Now on air: P1 Morgen` |
-
-DLS is polled every 10 seconds and pushed to Icecast using the source password. The admin password is used as a fallback if the source password is rejected.
-
-> **Note:** Icecast 2.4 expects metadata URL-encoded as Latin-1. The daemon handles this automatically.
+The plugin will appear under **Radio → DAB Radio** in LMS as a flat list of all services on the active MUX.
 
 ---
 

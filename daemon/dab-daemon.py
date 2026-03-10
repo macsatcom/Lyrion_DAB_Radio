@@ -29,9 +29,9 @@ WELLE_PORT         = 9090          # internal welle-cli HTTP port
 
 SERVICES_CACHE     = "/var/lib/dab-daemon/services.json"
 
-ICECAST_HOST       = "ice.smsweb.dk"
+ICECAST_HOST       = "your-icecast-host"
 ICECAST_PORT       = 8000
-ICECAST_SOURCE     = "sourcepass"
+ICECAST_SOURCE     = "your-source-password"
 ICECAST_ADMIN_USER = "admin"
 ICECAST_ADMIN_PASS = "your-admin-password"
 
@@ -239,6 +239,44 @@ def metadata_updater():
                 dls_state[mount] = dls
                 update_icecast_metadata(mount, dls)
 
+# ─── Stream watchdog ─────────────────────────────────────────────────────────
+
+def stream_watchdog():
+    """
+    Checks every 30 s if ffmpeg processes are still alive.
+    Restarts any that have died, as long as welle-cli is running.
+    """
+    while True:
+        time.sleep(30)
+        if not welle_proc or welle_proc.poll() is not None:
+            continue
+
+        with state_lock:
+            dead = [
+                (mount, info)
+                for mount, info in stream_procs.items()
+                if info["ffmpeg"].poll() is not None
+            ]
+
+        for mount, info in dead:
+            print(f"[watchdog] Restarting dead stream: {mount}")
+            with state_lock:
+                stream_procs.pop(mount, None)
+                dls_state.pop(mount, None)
+            start_stream_from_info(info["service"])
+
+def start_stream_from_info(svc_info):
+    """Restart a stream given the cached service info dict."""
+    # Reconstruct the minimal raw_svc needed by start_stream
+    raw_svc = {
+        "label": {"label": svc_info["name"]},
+        "sid":   svc_info["sid"],
+        "url_mp3": f"/mp3/{svc_info['sid']}",
+        "ptystring": "",
+        "mode": "DAB+ via RTL-SDR",
+    }
+    start_stream(raw_svc)
+
 # ─── Icecast metadata ─────────────────────────────────────────────────────────
 
 def update_icecast_metadata(mount, title):
@@ -439,6 +477,7 @@ if __name__ == "__main__":
     server = HTTPServer(("0.0.0.0", DAEMON_PORT), DABHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=metadata_updater, daemon=True).start()
+    threading.Thread(target=stream_watchdog, daemon=True).start()
     print(f"[daemon] HTTP API on port {DAEMON_PORT}")
     print(f"[daemon] Endpoints: /status  /muxes  /switch/<key>  /rescan  POST /stop")
 

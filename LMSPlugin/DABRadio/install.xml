@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <extension>
-    <n>PLUGIN_DABRADIO_MODULE_NAME</n>
+    <n>DAB Radio</n>
     <module>Plugins::DABRadio::Plugin</module>
     <playerMenu>RADIO</playerMenu>
 

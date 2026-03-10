@@ -63,25 +63,19 @@ sub handleFeed {
 
             my @items;
             for my $mux (@$muxes) {
-                my @svc_items;
                 for my $svc (@{ $mux->{services} || [] }) {
                     my $url = $svc->{stream};
                     if ($icecast_host) {
                         (my $mount = $url) =~ s|^https?://[^/]+||;
                         $url = "http://$icecast_host:$icecast_port$mount";
                     }
-                    push @svc_items, {
+                    push @items, {
                         type => 'audio',
                         name => $svc->{name},
                         url  => $url,
                         icon => 'plugins/DABRadio/html/images/LyrionDABRadio_svg.png',
                     };
                 }
-                push @items, {
-                    type  => 'outline',
-                    name  => $mux->{name},
-                    items => \@svc_items,
-                };
             }
 
             $cb->({ items => \@items });
