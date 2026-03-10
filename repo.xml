@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<extensions>
+    <details>
+        <title>DAB Radio via RTL-SDR</title>
+    </details>
+    <plugins>
+        <plugin name="DABRadio" version="1.0" minTarget="7.6" maxTarget="*">
+            <title>DAB Radio</title>
+            <desc>DAB+ radio reception via RTL-SDR and dab2eti/dablin</desc>
+            <url>https://github.com/YOUR_USERNAME/lms-dab-radio/archive/refs/heads/main.zip</url>
+            <link>https://github.com/YOUR_USERNAME/lms-dab-radio</link>
+            <creator>Your Name</creator>
+        </plugin>
+    </plugins>
+</extensions>

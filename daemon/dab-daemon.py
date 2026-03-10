@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""
+DAB Radio Daemon - See README.md for setup and configuration.
+
+Architecture:
+  welle-cli -c <channel> -Dw <welle_port>   (decodes all services, serves MP3)
+      ↓ http://localhost:<welle_port>/mp3/<SID>   (one per audio service)
+  ffmpeg -i <welle_url> -c copy -f mp3  →  Icecast/<mount>
+"""
+
+import os
+import sys
+import re
+import signal
+import subprocess
+import threading
+import time
+import json
+import base64
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, urlencode
+import urllib.parse
+import urllib.request
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+WELLE_CLI_BIN      = "/usr/local/bin/welle-cli"
+WELLE_PORT         = 9090          # internal welle-cli HTTP port
+
+SERVICES_CACHE     = "/var/lib/dab-daemon/services.json"
+
+ICECAST_HOST       = "ice.smsweb.dk"
+ICECAST_PORT       = 8000
+ICECAST_SOURCE     = "sourcepass"
+ICECAST_ADMIN_USER = "admin"
+ICECAST_ADMIN_PASS = "your-admin-password"
+
+DAEMON_PORT        = 9980
+
+# How long to wait for welle-cli to discover services
+DISCOVERY_TIMEOUT  = 30
+
+# ─── MUX configuration ────────────────────────────────────────────────────────
+
+MUX_LIST = [
+    {
+        "key":     "mux1",
+        "name":    "DR MUX (11C)",
+        "channel": "11C",
+    },
+    # Add more MUXes here:
+    # { "key": "mux2", "name": "MUX 2", "channel": "10B" },
+]
+
+# ─── State ────────────────────────────────────────────────────────────────────
+
+current_mux_key = None
+welle_proc      = None
+stream_procs    = {}   # mount → {"ffmpeg": proc, "service": svc_dict}
+dls_state       = {}   # mount → last known DLS string
+state_lock      = threading.Lock()
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def slugify(name):
+    s = name.lower().strip()
+    s = re.sub(r'[æÆ]', 'ae', s)
+    s = re.sub(r'[øØ]', 'oe', s)
+    s = re.sub(r'[åÅ]', 'aa', s)
+    s = re.sub(r'[^a-z0-9]+', '-', s)
+    return s.strip('-') or 'service'
+
+# ─── Service cache ────────────────────────────────────────────────────────────
+
+def load_service_cache():
+    try:
+        with open(SERVICES_CACHE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_service_cache(cache):
+    try:
+        os.makedirs(os.path.dirname(SERVICES_CACHE), exist_ok=True)
+        with open(SERVICES_CACHE, 'w') as f:
+            json.dump(cache, f, indent=2)
+    except Exception as e:
+        print(f"[daemon] Could not save service cache: {e}")
+
+# ─── welle-cli management ─────────────────────────────────────────────────────
+
+def stop_welle():
+    global welle_proc
+    if welle_proc and welle_proc.poll() is None:
+        welle_proc.terminate()
+        try:
+            welle_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            welle_proc.kill()
+        welle_proc = None
+        print("[daemon] welle-cli stopped")
+
+def start_welle(channel):
+    global welle_proc
+    stop_welle()
+    welle_proc = subprocess.Popen(
+        [WELLE_CLI_BIN, "-c", channel, "-Dw", str(WELLE_PORT)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    print(f"[daemon] welle-cli started on channel {channel} (internal port {WELLE_PORT})")
+
+def fetch_services_from_welle():
+    """
+    Poll welle-cli's /mux.json until the audio service list is stable.
+    Returns a list of raw service dicts from welle-cli.
+    """
+    url      = f"http://127.0.0.1:{WELLE_PORT}/mux.json"
+    deadline = time.time() + DISCOVERY_TIMEOUT
+    prev_count = -1
+    stable_since = None
+
+    while time.time() < deadline:
+        try:
+            resp = urllib.request.urlopen(url, timeout=2)
+            data = json.loads(resp.read())
+            # Audio services have a url_mp3 set
+            services = [s for s in data.get("services", []) if s.get("url_mp3")]
+            count = len(services)
+            if count != prev_count:
+                prev_count = count
+                stable_since = time.time()
+                if count:
+                    print(f"[daemon] Discovered {count} audio services...")
+            elif count > 0 and (time.time() - stable_since) >= 5:
+                print(f"[daemon] Service list stable at {count} services")
+                return services
+        except Exception:
+            pass
+        time.sleep(1)
+
+    # Timeout — return whatever we have
+    try:
+        resp = urllib.request.urlopen(url, timeout=3)
+        data = json.loads(resp.read())
+        return [s for s in data.get("services", []) if s.get("url_mp3")]
+    except Exception as e:
+        print(f"[daemon] Failed to fetch mux.json: {e}")
+        return []
+
+# ─── Per-service ffmpeg → Icecast ─────────────────────────────────────────────
+
+def start_stream(raw_svc):
+    """Pull MP3 from welle-cli and push to Icecast."""
+    name  = raw_svc["label"]["label"].strip()
+    sid   = raw_svc["sid"]
+    mount = f"/dab/{slugify(name)}"
+    src   = f"http://127.0.0.1:{WELLE_PORT}{raw_svc['url_mp3']}"
+
+    genre = raw_svc.get("ptystring") or "DAB"
+    desc  = raw_svc.get("mode") or "DAB+ via RTL-SDR"
+
+    ice_url = f"icecast://source:{ICECAST_SOURCE}@{ICECAST_HOST}:{ICECAST_PORT}{mount}"
+
+    cmd = [
+        "ffmpeg", "-loglevel", "error",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-i", src,
+        "-c:a", "libmp3lame", "-b:a", "128k",
+        "-f", "mp3",
+        "-ice_name",        name,
+        "-ice_description", desc,
+        "-ice_genre",       genre,
+        "-ice_public",      "1",
+        ice_url,
+    ]
+
+    proc = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
+    svc_info = {
+        "sid":    sid,
+        "name":   name,
+        "mount":  mount,
+        "stream": f"http://{ICECAST_HOST}:{ICECAST_PORT}{mount}",
+    }
+    stream_procs[mount] = {"ffmpeg": proc, "service": svc_info}
+    print(f"[daemon] Stream started: {name} ({sid}) → {mount}")
+
+def stop_stream(mount):
+    entry = stream_procs.pop(mount, None)
+    dls_state.pop(mount, None)
+    if not entry:
+        return
+    p = entry.get("ffmpeg")
+    if p and p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    print(f"[daemon] Stream stopped: {mount}")
+
+def stop_all_streams():
+    for mount in list(stream_procs.keys()):
+        stop_stream(mount)
+
+# ─── DLS metadata polling ─────────────────────────────────────────────────────
+
+def metadata_updater():
+    """
+    Polls welle-cli /mux.json every 10 s and pushes DLS updates to Icecast.
+    Runs as a daemon thread for the lifetime of the process.
+    """
+    while True:
+        time.sleep(10)
+        if not stream_procs or not welle_proc:
+            continue
+        try:
+            resp = urllib.request.urlopen(
+                f"http://127.0.0.1:{WELLE_PORT}/mux.json", timeout=3
+            )
+            data = json.loads(resp.read())
+        except Exception:
+            continue
+
+        svc_by_sid = {s["sid"]: s for s in data.get("services", [])}
+
+        with state_lock:
+            items = list(stream_procs.items())
+
+        for mount, info in items:
+            sid = info["service"]["sid"]
+            raw = svc_by_sid.get(sid)
+            if not raw:
+                continue
+            dls = raw.get("dls", {}).get("label", "").strip()
+            if dls and dls != dls_state.get(mount):
+                dls_state[mount] = dls
+                update_icecast_metadata(mount, dls)
+
+# ─── Icecast metadata ─────────────────────────────────────────────────────────
+
+def update_icecast_metadata(mount, title):
+    """Update stream title on Icecast. Tries source password first, then admin.
+
+    Icecast 2.4 expects the song parameter URL-encoded as Latin-1,
+    not UTF-8 — hence the explicit encoding.
+    """
+    song = urllib.parse.quote(title, encoding="latin-1", errors="replace")
+    params = f"mode=updinfo&mount={urllib.parse.quote(mount)}&song={song}"
+    url = f"http://{ICECAST_HOST}:{ICECAST_PORT}/admin/metadata?{params}"
+    for user, pw in [("source", ICECAST_SOURCE), (ICECAST_ADMIN_USER, ICECAST_ADMIN_PASS)]:
+        try:
+            req = urllib.request.Request(url)
+            creds = base64.b64encode(f"{user}:{pw}".encode()).decode()
+            req.add_header("Authorization", f"Basic {creds}")
+            urllib.request.urlopen(req, timeout=3)
+            print(f"[daemon] Metadata updated: {mount} → {title}")
+            return
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                print(f"[daemon] Metadata update failed ({mount}): {e}")
+                return
+        except Exception as e:
+            print(f"[daemon] Metadata update failed ({mount}): {e}")
+            return
+    print(f"[daemon] Metadata update failed ({mount}): authentication failed")
+
+# ─── MUX switching ────────────────────────────────────────────────────────────
+
+def get_mux(key):
+    for m in MUX_LIST:
+        if m["key"] == key:
+            return m
+    return None
+
+def switch_mux(mux_key):
+    mux = get_mux(mux_key)
+    if not mux:
+        print(f"[daemon] Unknown MUX: {mux_key}")
+        return False
+
+    def _do_switch():
+        global current_mux_key
+        print(f"[daemon] Switching to: {mux['name']}")
+
+        with state_lock:
+            stop_all_streams()
+            start_welle(mux["channel"])
+
+        print(f"[daemon] Waiting for service discovery (up to {DISCOVERY_TIMEOUT}s)...")
+        raw_services = fetch_services_from_welle()
+
+        if not raw_services:
+            print("[daemon] ERROR: No services found — check channel and reception")
+            return
+
+        # Build and cache a clean service list
+        services = [
+            {
+                "sid":    s["sid"],
+                "name":   s["label"]["label"].strip(),
+                "mount":  f"/dab/{slugify(s['label']['label'].strip())}",
+                "stream": f"http://{ICECAST_HOST}:{ICECAST_PORT}/dab/{slugify(s['label']['label'].strip())}",
+            }
+            for s in raw_services
+        ]
+        cache = load_service_cache()
+        cache[mux_key] = services
+        save_service_cache(cache)
+
+        with state_lock:
+            for s in raw_services:
+                start_stream(s)
+            current_mux_key = mux_key
+
+        print(f"[daemon] Switch complete: {mux['name']} — {len(services)} active streams")
+
+    threading.Thread(target=_do_switch, daemon=True).start()
+    return True
+
+# ─── HTTP API ─────────────────────────────────────────────────────────────────
+
+def json_response(handler, code, data):
+    body = json.dumps(data, indent=2).encode()
+    handler.send_response(code)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", len(body))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+class DABHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        print(f"[http] {self.address_string()} {fmt % args}")
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/status":
+            with state_lock:
+                active = [
+                    {
+                        "mount":        mount,
+                        "name":         info["service"]["name"],
+                        "sid":          info["service"]["sid"],
+                        "stream":       info["service"]["stream"],
+                        "ffmpeg_alive": info["ffmpeg"].poll() is None,
+                    }
+                    for mount, info in stream_procs.items()
+                ]
+            json_response(self, 200, {
+                "current_mux":    current_mux_key,
+                "welle_alive":    welle_proc is not None and welle_proc.poll() is None,
+                "active_streams": active,
+            })
+
+        elif parsed.path == "/muxes":
+            cache = load_service_cache()
+            out = []
+            for m in MUX_LIST:
+                services = cache.get(m["key"], [])
+                out.append({
+                    "key":      m["key"],
+                    "name":     m["name"],
+                    "channel":  m["channel"],
+                    "scanned":  len(services) > 0,
+                    "services": [
+                        {
+                            "sid":    s["sid"],
+                            "name":   s["name"],
+                            "stream": s["stream"],
+                        }
+                        for s in services
+                    ],
+                })
+            json_response(self, 200, out)
+
+        elif parsed.path == "/rescan":
+            if current_mux_key:
+                cache = load_service_cache()
+                cache.pop(current_mux_key, None)
+                save_service_cache(cache)
+                switch_mux(current_mux_key)
+                json_response(self, 202, {"ok": True, "note": "rescanning..."})
+            else:
+                json_response(self, 400, {"error": "no active MUX"})
+
+        elif parsed.path.startswith("/switch/"):
+            mux_key = parsed.path[len("/switch/"):]
+            if switch_mux(mux_key):
+                json_response(self, 202, {"ok": True, "switching_to": mux_key})
+            else:
+                json_response(self, 404, {"error": f"unknown mux: {mux_key}"})
+
+        else:
+            json_response(self, 404, {"error": "not found"})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+
+        if parsed.path == "/switch":
+            mux_key = qs.get("mux", [None])[0]
+            if not mux_key:
+                json_response(self, 400, {"error": "missing mux parameter"})
+                return
+            if switch_mux(mux_key):
+                json_response(self, 202, {"ok": True, "switching_to": mux_key})
+            else:
+                json_response(self, 404, {"error": f"unknown mux: {mux_key}"})
+
+        elif parsed.path == "/stop":
+            with state_lock:
+                stop_all_streams()
+                stop_welle()
+            json_response(self, 200, {"ok": True, "status": "stopped"})
+
+        else:
+            json_response(self, 404, {"error": "not found"})
+
+# ─── Entrypoint ───────────────────────────────────────────────────────────────
+
+def shutdown_handler(sig, frame):
+    print("\n[daemon] shutting down...")
+    stop_all_streams()
+    stop_welle()
+    os._exit(0)
+
+if __name__ == "__main__":
+    if not MUX_LIST:
+        print("[daemon] ERROR: No MUXes configured")
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT,  shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+    server = HTTPServer(("0.0.0.0", DAEMON_PORT), DABHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=metadata_updater, daemon=True).start()
+    print(f"[daemon] HTTP API on port {DAEMON_PORT}")
+    print(f"[daemon] Endpoints: /status  /muxes  /switch/<key>  /rescan  POST /stop")
+
+    switch_mux(MUX_LIST[0]["key"])
+
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        shutdown_handler(None, None)

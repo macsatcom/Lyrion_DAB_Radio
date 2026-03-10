@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<extension>
+    <n>PLUGIN_DABRADIO_MODULE_NAME</n>
+    <module>Plugins::DABRadio::Plugin</module>
+    <playerMenu>RADIO</playerMenu>
+
+    <description>PLUGIN_DABRADIO_MODULE_NAME_DESC</description>
+    <icon>plugins/DABRadio/html/images/DABRadio.png</icon>
+
+    <creator>Your Name</creator>
+    <optionsURL>plugins/DABRadio/settings/basic.html</optionsURL>
+
+    <defaultState>enabled</defaultState>
+    <version>1.0</version>
+
+    <targetApplication>
+        <id>SqueezeCenter</id>
+        <minVersion>7.6</minVersion>
+        <maxVersion>*</maxVersion>
+    </targetApplication>
+</extension>
