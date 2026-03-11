@@ -1,17 +1,17 @@
 <?xml version="1.0"?>
 <extension>
-    <n>DAB Radio</n>
+    <name>PLUGIN_DABRADIO_MODULE_NAME</name>
     <module>Plugins::DABRadio::Plugin</module>
     <playerMenu>RADIO</playerMenu>
 
     <description>PLUGIN_DABRADIO_MODULE_NAME_DESC</description>
     <icon>plugins/DABRadio/html/images/LyrionDABRadio_svg.png</icon>
 
-    <creator>Your Name</creator>
+    <creator>Kasper S Nielsen</creator>
     <optionsURL>plugins/DABRadio/settings/basic.html</optionsURL>
 
     <defaultState>enabled</defaultState>
-    <version>1.0</version>
+    <version>1.01</version>
 
     <targetApplication>
         <id>SqueezeCenter</id>
