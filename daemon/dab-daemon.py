@@ -36,6 +36,15 @@ def linear_to_db(value):
 
 WELLE_CLI_BIN      = os.environ.get("WELLE_CLI_BIN",    "/usr/local/bin/welle-cli")
 WELLE_PORT         = int(os.environ.get("WELLE_PORT",   "9090"))
+
+# RTL-SDR RX gain passed to welle-cli's -g flag.
+# Unset (or "auto", case-insensitive) → omit -g entirely, welle-cli runs its
+# own software AGC (default behaviour). Any other value is passed through
+# literally as the gain *index* into the tuner's gain table (welle-cli logs
+# "Supported gain values" / a per-step list to stderr on startup — see
+# dab-daemon.log — to help pick a valid index).
+WELLE_GAIN         = os.environ.get("WELLE_GAIN", "").strip()
+WELLE_GAIN_IS_AUTO = WELLE_GAIN == "" or WELLE_GAIN.lower() == "auto"
 SERVICES_CACHE     = os.environ.get("SERVICES_CACHE",   "/var/lib/dab-daemon/services.json")
 ICECAST_HOST       = os.environ.get("ICECAST_HOST",     "your-icecast-host")
 ICECAST_PORT       = int(os.environ.get("ICECAST_PORT", "8000"))
@@ -381,8 +390,14 @@ def stop_welle():
 def start_welle(channel):
     global welle_proc, welle_stderr_thread
     stop_welle()
+    cmd = [WELLE_CLI_BIN, "-c", channel, "-Dw", str(WELLE_PORT)]
+    if WELLE_GAIN_IS_AUTO:
+        gain_desc = "auto (AGC)"
+    else:
+        cmd += ["-g", WELLE_GAIN]
+        gain_desc = f"fixed (index {WELLE_GAIN})"
     welle_proc = subprocess.Popen(
-        [WELLE_CLI_BIN, "-c", channel, "-Dw", str(WELLE_PORT)],
+        cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
@@ -391,7 +406,7 @@ def start_welle(channel):
         target=read_stderr_thread, args=(welle_proc, "welle-cli"), daemon=True
     )
     welle_stderr_thread.start()
-    logger_daemon.info(f"welle-cli started on channel {channel} (internal port {WELLE_PORT})")
+    logger_daemon.info(f"welle-cli started on channel {channel} (internal port {WELLE_PORT}, gain={gain_desc})")
 
 # ─── Consolidated mux.json fetcher ────────────────────────────────────────────
 
@@ -427,18 +442,29 @@ def signal_quality_monitor():
             continue
 
         # Global metrics
-        snr = data.get("snr")
-        freq_corr = data.get("frequencycorrection")
+        # NOTE: welle-cli nests these under "demodulator" / "receiver.hardware" —
+        # they are NOT top-level keys in mux.json.
+        demod = data.get("demodulator", {}) or {}
+        snr = demod.get("snr")
+        freq_corr = demod.get("frequencycorrection")
+        gain = (data.get("receiver", {}) or {}).get("hardware", {}).get("gain")
 
         if snr is not None:
             msg = f"SNR={snr:.1f} dB"
             if freq_corr is not None:
                 msg += f", freq_corr={freq_corr} Hz"
+            if gain is not None:
+                msg += f", gain={gain:.1f} dB"
 
             if snr < SNR_WARNING_THRESHOLD:
                 logger_signal.warning(f"{msg} — BELOW THRESHOLD ({SNR_WARNING_THRESHOLD} dB)")
             else:
                 logger_signal.info(msg)
+
+        # welle-cli's own Info/Error messages (ADC overload, device resets, etc.)
+        # These are pre-formatted with their own timestamp by welle-cli itself.
+        for wmsg in data.get("messages", []) or []:
+            logger_signal.info(f"welle-cli: {wmsg}")
 
         # Per-service metrics
         services = data.get("services", [])
@@ -945,8 +971,10 @@ class DABHandler(BaseHTTPRequestHandler):
                 data = latest_mux_json
 
             snr = None
+            gain = None
             if data:
-                snr = data.get("snr")
+                snr = (data.get("demodulator", {}) or {}).get("snr")
+                gain = (data.get("receiver", {}) or {}).get("hardware", {}).get("gain")
                 if snr is not None and snr < SNR_WARNING_THRESHOLD:
                     if overall == "OK":
                         overall = "DEGRADED"
@@ -954,6 +982,7 @@ class DABHandler(BaseHTTPRequestHandler):
             json_response(self, 200, {
                 "welle_status": welle_alive and "alive" or "unresponsive",
                 "signal_snr":  snr,
+                "signal_gain": gain,
                 "streams":     streams,
                 "overall":     overall,
             })

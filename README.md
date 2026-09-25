@@ -150,6 +150,17 @@ environment:
 
 Multiple MUXes are supported — the daemon can switch between them via the API.
 
+### Configuring RX gain
+
+By default, welle-cli runs its own software AGC (automatic gain control). To use a fixed gain instead, set `WELLE_GAIN`:
+
+```yaml
+environment:
+  WELLE_GAIN: "29"   # gain table index — see below
+```
+
+`WELLE_GAIN` is a **gain table index** for your specific RTL-SDR tuner, not a dB value. Leave it unset (or set it to `auto`) to run with AGC, then check `dab-daemon.log` for welle-cli's "Supported gain values" list printed at startup to find valid index values for your dongle. `signal-quality.log` also logs the live effective gain (in dB) every 10 seconds, alongside SNR, so you can compare AGC's chosen gain against dropouts before deciding to fix it.
+
 ---
 
 ## Option B — Manual installation

@@ -28,6 +28,9 @@ services:
       ICECAST_MOUNT:      ${ICECAST_MOUNT:-/dab}
       # ── Daemon ──────────────────────────────────────────────────────────────
       DAEMON_PORT:        ${DAEMON_PORT:-9980}
+      # ── RTL-SDR RX gain ─────────────────────────────────────────────────────
+      # 'auto' (default) = software AGC. Or a fixed gain table index (see .env.example).
+      WELLE_GAIN:         ${WELLE_GAIN:-auto}
       # ── MUX list (optional JSON override) ───────────────────────────────────
       MUX_LIST:           ${MUX_LIST:-}
     volumes:
