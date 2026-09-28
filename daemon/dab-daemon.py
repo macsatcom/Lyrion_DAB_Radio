@@ -317,6 +317,7 @@ mux_json_event  = threading.Event()
 
 # Signal quality tracking
 prev_error_counters = {}  # mount → {frameerrors, rserrors, aacerrors}
+icecast_mount_status = {}  # mount → bool, last known "listed in Icecast admin" state
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -441,71 +442,87 @@ def signal_quality_monitor():
         if not data:
             continue
 
-        # Global metrics
-        # NOTE: welle-cli nests these under "demodulator" / "receiver.hardware" —
-        # they are NOT top-level keys in mux.json.
-        demod = data.get("demodulator", {}) or {}
-        snr = demod.get("snr")
-        freq_corr = demod.get("frequencycorrection")
-        gain = (data.get("receiver", {}) or {}).get("hardware", {}).get("gain")
+        # The whole cycle is guarded: welle-cli's mux.json shape has already
+        # bitten us once (a single malformed/None field silently killed this
+        # thread for good, with no trace in any of our log files — see the
+        # "audiolevel: null" bug below). Never let one bad record take the
+        # entire signal-quality logger down again.
+        try:
+            # Global metrics
+            # NOTE: welle-cli nests these under "demodulator" / "receiver.hardware" —
+            # they are NOT top-level keys in mux.json.
+            demod = data.get("demodulator", {}) or {}
+            snr = demod.get("snr")
+            freq_corr = demod.get("frequencycorrection")
+            gain = (data.get("receiver", {}) or {}).get("hardware", {}).get("gain")
 
-        if snr is not None:
-            msg = f"SNR={snr:.1f} dB"
-            if freq_corr is not None:
-                msg += f", freq_corr={freq_corr} Hz"
-            if gain is not None:
-                msg += f", gain={gain:.1f} dB"
+            if snr is not None:
+                msg = f"SNR={snr:.1f} dB"
+                if freq_corr is not None:
+                    msg += f", freq_corr={freq_corr} Hz"
+                if gain is not None:
+                    msg += f", gain={gain:.1f} dB"
 
-            if snr < SNR_WARNING_THRESHOLD:
-                logger_signal.warning(f"{msg} — BELOW THRESHOLD ({SNR_WARNING_THRESHOLD} dB)")
-            else:
-                logger_signal.info(msg)
+                if snr < SNR_WARNING_THRESHOLD:
+                    logger_signal.warning(f"{msg} — BELOW THRESHOLD ({SNR_WARNING_THRESHOLD} dB)")
+                else:
+                    logger_signal.info(msg)
 
-        # welle-cli's own Info/Error messages (ADC overload, device resets, etc.)
-        # These are pre-formatted with their own timestamp by welle-cli itself.
-        for wmsg in data.get("messages", []) or []:
-            logger_signal.info(f"welle-cli: {wmsg}")
+            # welle-cli's own Info/Error messages (ADC overload, device resets, etc.)
+            # These are pre-formatted with their own timestamp by welle-cli itself.
+            for wmsg in data.get("messages", []) or []:
+                logger_signal.info(f"welle-cli: {wmsg}")
 
-        # Per-service metrics
-        services = data.get("services", [])
-        for svc in services:
-            if not svc.get("url_mp3"):
-                continue
-            name = svc.get("label", {}).get("label", "unknown")
-            sid = svc.get("sid")
-            mount = f"/dab/{slugify(name)}"
+            # Per-service metrics
+            services = data.get("services", [])
+            for svc in services:
+                if not svc.get("url_mp3"):
+                    continue
+                name = svc.get("label", {}).get("label", "unknown")
+                sid = svc.get("sid")
+                mount = f"/dab/{slugify(name)}"
 
-            audio = svc.get("audiolevel", {})
-            left_linear = audio.get("left", 0)
-            right_linear = audio.get("right", 0)
-            left_db = linear_to_db(left_linear)
-            right_db = linear_to_db(right_linear)
+                # welle-cli sends "audiolevel": null (not an omitted key) until
+                # a service has decoded its first audio frame. dict.get(key,
+                # default) only falls back when the KEY is absent, not when
+                # its value is explicitly None — so this must be `or {}`,
+                # not `, {}`. The old `svc.get("audiolevel", {})` returned
+                # None here and .get() on it threw AttributeError, which
+                # (being uncaught) silently killed this whole thread — this
+                # is why signal-quality.log went dead for weeks.
+                audio = svc.get("audiolevel") or {}
+                left_linear = audio.get("left", 0)
+                right_linear = audio.get("right", 0)
+                left_db = linear_to_db(left_linear)
+                right_db = linear_to_db(right_linear)
 
-            errs = svc.get("errorcounters", {})
-            fe = errs.get("frameerrors", 0)
-            rs = errs.get("rserrors", 0)
-            aac = errs.get("aacerrors", 0)
+                errs = svc.get("errorcounters") or {}
+                fe = errs.get("frameerrors", 0)
+                rs = errs.get("rserrors", 0)
+                aac = errs.get("aacerrors", 0)
 
-            log_msg = f"{name} (SID={sid}) audio_left={left_db:.1f} dBFS audio_right={right_db:.1f} dBFS frameerrors={fe} rserrors={rs} aacerrors={aac}"
-            logger_signal.info(log_msg)
+                log_msg = f"{name} (SID={sid}) audio_left={left_db:.1f} dBFS audio_right={right_db:.1f} dBFS frameerrors={fe} rserrors={rs} aacerrors={aac}"
+                logger_signal.info(log_msg)
 
-            # Check for warnings
-            if left_db < -60 or right_db < -60:
-                logger_signal.warning(f"{name} audio level very low (silence?): left={left_db:.1f}, right={right_db:.1f}")
+                # Check for warnings
+                if left_db < -60 or right_db < -60:
+                    logger_signal.warning(f"{name} audio level very low (silence?): left={left_db:.1f}, right={right_db:.1f}")
 
-            prev = prev_error_counters.get(mount, {})
-            if prev:
-                df = fe - prev.get("frameerrors", 0)
-                dr = rs - prev.get("rserrors", 0)
-                da = aac - prev.get("aacerrors", 0)
-                if df > 5 or dr > 5 or da > 5:
-                    logger_signal.warning(f"{name} error counters increased significantly: frame+{df}, rs+{dr}, aac+{da}")
+                prev = prev_error_counters.get(mount, {})
+                if prev:
+                    df = fe - prev.get("frameerrors", 0)
+                    dr = rs - prev.get("rserrors", 0)
+                    da = aac - prev.get("aacerrors", 0)
+                    if df > 5 or dr > 5 or da > 5:
+                        logger_signal.warning(f"{name} error counters increased significantly: frame+{df}, rs+{dr}, aac+{da}")
 
-            # High RS errors directly cause audio glitches/dropouts
-            if rs > 100:
-                logger_signal.warning(f"{name} HIGH RS errors ({rs}) — expect audio dropouts/glitches")
+                # High RS errors directly cause audio glitches/dropouts
+                if rs > 100:
+                    logger_signal.warning(f"{name} HIGH RS errors ({rs}) — expect audio dropouts/glitches")
 
-            prev_error_counters[mount] = {"frameerrors": fe, "rserrors": rs, "aacerrors": aac}
+                prev_error_counters[mount] = {"frameerrors": fe, "rserrors": rs, "aacerrors": aac}
+        except Exception:
+            logger_daemon.exception("signal_quality_monitor: unexpected error processing mux.json — skipping this cycle")
 
 # ─── Service discovery ───────────────────────────────────────────────────────
 
@@ -551,20 +568,27 @@ def fetch_services_from_welle():
 
 # ─── Per-service ffmpeg → Icecast ─────────────────────────────────────────────
 
-FFMPEG_ERROR_KEYWORDS = ['error', 'failed', 'reconnect', 'buffer', 'underflow', 'overflow', 'dropped', 'discontinuity']
-
 def read_ffmpeg_stderr(proc, mount, name):
-    """Read ffmpeg stderr and log relevant lines."""
+    """Read ffmpeg stderr and log every line.
+
+    ffmpeg is launched with -loglevel error (see start_stream()), so
+    anything it writes to stderr is ALREADY error-severity — there is no
+    need to additionally whitelist by keyword. The previous version only
+    logged a line if it contained one of a handful of substrings
+    ('error', 'failed', 'reconnect', 'buffer', ...), which silently
+    dropped anything that didn't happen to match — e.g. "Server returned
+    404 Not Found", "Connection timed out", "End of file", HTTP/EOF
+    conditions on a stalled input read from welle-cli — exactly the kind
+    of line that would explain a brief listener-facing dropout/rebuffer,
+    and exactly the kind of line most likely to be missing when you need
+    it most.
+    """
     try:
         for line in proc.stderr:
             line = line.decode('utf-8', errors='replace').strip()
             if not line:
                 continue
-            lower = line.lower()
-            for kw in FFMPEG_ERROR_KEYWORDS:
-                if kw in lower:
-                    logger_ffmpeg.warning(f"[{name}] {line}")
-                    break
+            logger_ffmpeg.warning(f"[{name}] {line}")
     except Exception:
         pass
 
@@ -797,7 +821,17 @@ def preventive_restart_scheduler():
 # ─── Icecast Stats Poller ────────────────────────────────────────────────────
 
 def icecast_stats_poller():
-    """Polls Icecast admin endpoint every 30 s and logs mount stats."""
+    """Polls Icecast admin endpoint every 30 s and logs mount stats.
+
+    NOTE: failures here used to be logged at DEBUG level, but logger_daemon's
+    level is INFO — so every poll failure (wrong host/port/credentials, or
+    Icecast itself being briefly unreachable) was silently discarded and
+    never appeared in dab-daemon.log. This poller could have been failing
+    on every single cycle with zero trace in any log file. Now logged at
+    WARNING, and a mount unexpectedly disappearing from Icecast's own mount
+    list — which is exactly what a listener-facing "feed briefly broken"
+    event would look like from this side — is called out explicitly too.
+    """
     while True:
         time.sleep(30)
         if not stream_procs:
@@ -814,10 +848,22 @@ def icecast_stats_poller():
 
             # Very basic parse — look for mount point info
             for mount in list(stream_procs.keys()):
-                if mount in html:
+                active = mount in html
+                was_active = icecast_mount_status.get(mount)
+                icecast_mount_status[mount] = active
+
+                if active:
                     logger_daemon.info(f"Icecast mount {mount} is active")
+                else:
+                    # Only a real signal if we've previously seen this mount
+                    # listed — right after startup/switch, Icecast may not
+                    # have registered it yet.
+                    if was_active:
+                        logger_daemon.warning(f"Icecast mount {mount} DISAPPEARED from listmounts (was active last cycle)")
+                    else:
+                        logger_daemon.warning(f"Icecast mount {mount} not found in listmounts")
         except Exception as e:
-            logger_daemon.debug(f"Icecast stats poll failed: {e}")
+            logger_daemon.warning(f"Icecast stats poll failed: {e}")
 
 # ─── Icecast metadata ─────────────────────────────────────────────────────────
 
