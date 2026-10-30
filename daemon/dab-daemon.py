@@ -378,7 +378,31 @@ def stop_welle():
         except subprocess.TimeoutExpired:
             logger_daemon.warning("welle-cli did not respond to SIGTERM — sending SIGKILL")
             welle_proc.kill()
-            welle_proc.wait(timeout=5)
+            try:
+                welle_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # SIGKILL cannot normally be ignored by a process — if it's
+                # still not gone, welle-cli is almost certainly wedged in an
+                # uninterruptible kernel wait (typically a stuck USB/libusb
+                # call to the RTL-SDR dongle). There is nothing more we can
+                # do at the signal level. The OLD behavior let this
+                # TimeoutExpired propagate uncaught out of stop_welle(),
+                # which silently killed whichever thread called it
+                # (_do_switch(), including the one the watchdog's auto-
+                # restart runs in) — streams were already torn down by then
+                # with no replacement ever started, and nothing surfaced
+                # beyond a raw traceback on stderr. Log it clearly and carry
+                # on: the Popen handle may end up referencing a zombie/stuck
+                # process, but that's still strictly better than silently
+                # wedging the whole switch/restart path forever.
+                logger_daemon.error(
+                    "welle-cli did not die even after SIGKILL — likely stuck in an "
+                    "uninterruptible kernel wait (USB/RTL-SDR). Proceeding anyway; "
+                    "the RTL-SDR device may still be held by the old process, which "
+                    "would make the next welle-cli fail to open it. If that happens, "
+                    "a full container/host restart is the only remaining fix — check "
+                    "the physical USB connection too (cable/port/hub)."
+                )
         welle_proc = None
         welle_stderr_thread = None
         mux_json_event.clear()
@@ -911,37 +935,55 @@ def switch_mux(mux_key):
         global current_mux_key
         logger_daemon.info(f"Switching to: {mux['name']}")
 
-        with state_lock:
-            stop_all_streams()
-            start_welle(mux["channel"])
+        # The whole switch is guarded now: this runs in a detached daemon
+        # thread (started via switch_mux(), including from welle_watchdog()'s
+        # automatic restart path), so an uncaught exception here doesn't
+        # just fail the switch — it silently kills the thread with nothing
+        # but a raw traceback on stderr, AFTER stop_all_streams() has already
+        # torn down every active stream and before any replacement is
+        # started. That is exactly how "channels disappear" with errors in
+        # the logs but no further sign of what happened: see stop_welle()'s
+        # wedged-process case, which used to propagate straight out of here.
+        try:
+            with state_lock:
+                stop_all_streams()
+                start_welle(mux["channel"])
 
-        logger_daemon.info(f"Waiting for service discovery (up to {DISCOVERY_TIMEOUT}s)...")
-        raw_services = fetch_services_from_welle()
+            logger_daemon.info(f"Waiting for service discovery (up to {DISCOVERY_TIMEOUT}s)...")
+            raw_services = fetch_services_from_welle()
 
-        if not raw_services:
-            logger_daemon.warning("ERROR: No services found — check channel and reception")
-            return
+            if not raw_services:
+                logger_daemon.warning("ERROR: No services found — check channel and reception")
+                return
 
-        # Build and cache a clean service list
-        services = [
-            {
-                "sid":    s["sid"],
-                "name":   s["label"]["label"].strip(),
-                "mount":  f"/dab/{slugify(s['label']['label'].strip())}",
-                "stream": f"http://{ICECAST_HOST}:{ICECAST_PORT}/dab/{slugify(s['label']['label'].strip())}",
-            }
-            for s in raw_services
-        ]
-        cache = load_service_cache()
-        cache[mux_key] = services
-        save_service_cache(cache)
+            # Build and cache a clean service list
+            services = [
+                {
+                    "sid":    s["sid"],
+                    "name":   s["label"]["label"].strip(),
+                    "mount":  f"/dab/{slugify(s['label']['label'].strip())}",
+                    "stream": f"http://{ICECAST_HOST}:{ICECAST_PORT}/dab/{slugify(s['label']['label'].strip())}",
+                }
+                for s in raw_services
+            ]
+            cache = load_service_cache()
+            cache[mux_key] = services
+            save_service_cache(cache)
 
-        with state_lock:
-            for s in raw_services:
-                start_stream(s)
-            current_mux_key = mux_key
+            with state_lock:
+                for s in raw_services:
+                    start_stream(s)
+                current_mux_key = mux_key
 
-        logger_daemon.info(f"Switch complete: {mux['name']} — {len(services)} active streams")
+            logger_daemon.info(f"Switch complete: {mux['name']} — {len(services)} active streams")
+        except Exception:
+            logger_daemon.exception(
+                f"Switching to '{mux['name']}' failed unexpectedly — streams may already be "
+                "down with no replacement running. Marking no MUX as active so /status and "
+                "/health reflect reality instead of a stale value."
+            )
+            with state_lock:
+                current_mux_key = None
 
     threading.Thread(target=_do_switch, daemon=True).start()
     return True
