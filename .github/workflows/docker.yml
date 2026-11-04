@@ -56,3 +56,52 @@ jobs:
           # Cache layers in GitHub's cache to speed up subsequent builds
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Creates a GitHub Release for every version tag, alongside the Docker
+  # image above. This exists because the daemon is also installed manually
+  # (see README "Option B"), with no Docker image at all — a new version
+  # that only ever shows up as a Docker image on GHCR is invisible to those
+  # users. A bug fix matters exactly as much there as in Docker; both
+  # install paths must be able to discover and apply it the same way.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create a GitHub Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need the tagged commit's full message
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping (idempotent re-run, e.g. a re-pushed tag)."
+            exit 0
+          fi
+
+          {
+            git log -1 --format='%B' "$TAG"
+            echo
+            echo "---"
+            echo
+            echo "### Upgrading"
+            echo
+            echo '**Docker:**'
+            echo '```'
+            echo 'docker compose pull'
+            echo 'docker compose up -d'
+            echo '```'
+            echo
+            echo "**Manual installation:** \`git pull\`, then re-copy \`daemon/dab-daemon.py\` to \`/usr/local/bin/dab-daemon.py\` and restart the \`dab-daemon\` service."
+            echo
+            echo "Docker image: \`ghcr.io/${{ github.repository_owner }}/lyrion-dab-radio:$TAG\` (also tagged \`:latest\`)"
+          } > release_notes.md
+
+          gh release create "$TAG" --title "$TAG" --notes-file release_notes.md
