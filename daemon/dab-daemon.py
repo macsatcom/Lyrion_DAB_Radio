@@ -714,8 +714,21 @@ _welle_restart_in_progress = threading.Event()
 
 def _welle_health_check():
     """
-    Returns True if welle-cli process is alive AND its HTTP endpoint responds.
-    A hanging/zombie welle-cli that no longer serves data is considered dead.
+    Returns True if welle-cli process is alive, its HTTP endpoint responds,
+    AND it is actually attached to a real RTL-SDR device.
+
+    A transient USB hiccup (the dongle briefly dropping off the bus and
+    re-enumerating — some hosts do this under load) can make rtlsdr_open()
+    fail with libusb's "No device" error at the exact moment welle-cli
+    starts. welle-cli does not treat that as fatal: it falls back to its
+    built-in "Null device", which feeds the demodulator all-zero I/Q
+    samples forever while keeping the process AND its HTTP server fully
+    alive and responsive. A check that only asks "does it respond to HTTP"
+    considers that state perfectly healthy forever — no ensemble, no
+    services, no audio, and nothing to ever trigger an automatic restart.
+    welle-cli's own mux.json reports receiver.hardware.name as the literal
+    string "Null device" in this state (a real RTL-SDR reports its
+    manufacturer/product/serial instead), which is what we key off here.
     """
     with state_lock:
         proc = welle_proc
@@ -726,8 +739,23 @@ def _welle_health_check():
         resp = urllib.request.urlopen(
             f"http://127.0.0.1:{WELLE_PORT}/mux.json", timeout=5
         )
-        resp.read()
+        body = resp.read()
         resp.close()
+        try:
+            data = json.loads(body)
+            hw_name = (data.get("receiver", {}) or {}).get("hardware", {}).get("name", "")
+            if hw_name == "Null device":
+                logger_daemon.warning(
+                    "welle-watchdog: welle-cli is running against the Null device "
+                    "(real RTL-SDR failed to open — likely a transient USB drop) — "
+                    "treating as unhealthy so it gets restarted"
+                )
+                return False
+        except (ValueError, AttributeError):
+            # Unexpected JSON shape — don't let a parsing issue here cause a
+            # false "unhealthy" verdict; fall back to the plain reachability
+            # check below.
+            pass
         return True
     except Exception:
         return False
