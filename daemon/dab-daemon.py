@@ -963,6 +963,22 @@ def switch_mux(mux_key):
         global current_mux_key
         logger_daemon.info(f"Switching to: {mux['name']}")
 
+        # Set this BEFORE attempting anything, not just on success.
+        # welle_watchdog() skips its own health-check loop entirely while
+        # current_mux_key is falsy ("if not mux_key: continue") — so if this
+        # was the very first switch ever attempted (daemon startup calls
+        # switch_mux() once, before current_mux_key has ever been set) and
+        # it fails right here — e.g. a transient USB hiccup making welle-cli
+        # fall back to the Null device (see _welle_health_check()) — the
+        # watchdog would never even start checking, let alone recover,
+        # because there was never a mux_key for it to check in the first
+        # place. Setting it optimistically means every failure path below,
+        # including this one, still leaves the watchdog a target to retry
+        # against every 15s, the same self-healing path that already covers
+        # a mux failing later during a scheduled/triggered restart.
+        with state_lock:
+            current_mux_key = mux_key
+
         # The whole switch is guarded now: this runs in a detached daemon
         # thread (started via switch_mux(), including from welle_watchdog()'s
         # automatic restart path), so an uncaught exception here doesn't
@@ -1001,17 +1017,21 @@ def switch_mux(mux_key):
             with state_lock:
                 for s in raw_services:
                     start_stream(s)
-                current_mux_key = mux_key
 
             logger_daemon.info(f"Switch complete: {mux['name']} — {len(services)} active streams")
         except Exception:
+            # NOTE: deliberately NOT resetting current_mux_key to None here
+            # (an earlier version of this fix did). Clearing it made /health
+            # report "no MUX active" honestly, but it ALSO put us right back
+            # in the gap this comment describes above — the watchdog would
+            # stop checking entirely rather than retrying. Keeping mux_key
+            # set to the (failed) target is what lets the watchdog keep
+            # trying every 15s until reception/USB/whatever recovers.
             logger_daemon.exception(
                 f"Switching to '{mux['name']}' failed unexpectedly — streams may already be "
-                "down with no replacement running. Marking no MUX as active so /status and "
-                "/health reflect reality instead of a stale value."
+                "down with no replacement running. Leaving current_mux_key set so the "
+                "watchdog keeps retrying rather than giving up on this MUX."
             )
-            with state_lock:
-                current_mux_key = None
 
     threading.Thread(target=_do_switch, daemon=True).start()
     return True
