@@ -308,6 +308,7 @@ welle_proc      = None
 welle_stderr_thread = None
 stream_procs    = {}   # mount → {"ffmpeg": proc, "service": svc_dict, "stderr_thread": thread, "reconnect_count": int}
 dls_state       = {}   # mount → last known DLS string
+failed_stream_restarts = {}  # mount → svc_info, for stream_watchdog() to keep retrying
 state_lock      = threading.Lock()
 
 # Consolidated mux.json cache
@@ -359,13 +360,58 @@ def save_service_cache(cache):
 
 # ─── welle-cli management ─────────────────────────────────────────────────────
 
+# welle-cli logs a "SuperframeFilter: Superframe sync started.../succeeded
+# after N frame(s)" line for EVERY service on EVERY resync. During an
+# ordinary brief sync blip this is a handful of lines and genuinely useful.
+# During a SUSTAINED signal-quality problem (e.g. a real antenna/reception
+# issue), welle-cli can re-attempt this for every service many times per
+# second, continuously, for hours — in production this flooded through
+# every rotated log file (default 10MB x 3 backups) within a single
+# morning, wiping out exactly the log history needed to diagnose the
+# underlying problem. Everything else from welle-cli's stderr has
+# consistently been far rarer and has been the actual source of every
+# real diagnosis so far (Lost coarse sync, usb_open errors, Null device
+# fallback, ...) — only this one specific, proven-to-flood message family
+# is throttled; nothing else changes.
+_STDERR_THROTTLE_PATTERNS = ("SuperframeFilter: Superframe sync",)
+_STDERR_THROTTLE_INTERVAL_SECONDS = 5.0
+_stderr_throttle_state = {}  # pattern -> {"last": monotonic ts, "suppressed": int}
+
 def read_stderr_thread(proc, name):
-    """Read stderr from a process and log any output."""
+    """Read stderr from a process and log any output.
+
+    A small set of welle-cli lines (see _STDERR_THROTTLE_PATTERNS) are
+    rate-limited instead of logged unthrottled — see the comment there for
+    why. Everything else is logged exactly as before, one line in, one
+    line out, so rarer/higher-value messages (Lost coarse sync, usb_open
+    errors, Null device fallback, etc. — the ones that have actually been
+    useful for every real diagnosis so far) are completely unaffected.
+    """
     try:
         for line in proc.stderr:
             line = line.decode('utf-8', errors='replace').strip()
-            if line:
+            if not line:
+                continue
+
+            matched_pattern = next((p for p in _STDERR_THROTTLE_PATTERNS if p in line), None)
+            if matched_pattern is None:
                 logger_daemon.info(f"[{name}] {line}")
+                continue
+
+            now = time.monotonic()
+            state = _stderr_throttle_state.setdefault(matched_pattern, {"last": 0.0, "suppressed": 0})
+            if now - state["last"] < _STDERR_THROTTLE_INTERVAL_SECONDS:
+                state["suppressed"] += 1
+                continue
+
+            suppressed = state["suppressed"]
+            state["last"] = now
+            state["suppressed"] = 0
+            suffix = (
+                f" (+{suppressed} similar line(s) suppressed in the last "
+                f"{_STDERR_THROTTLE_INTERVAL_SECONDS:.0f}s)"
+            ) if suppressed else ""
+            logger_daemon.info(f"[{name}] {line}{suffix}")
     except Exception:
         pass
 
@@ -661,6 +707,10 @@ def stop_stream(mount):
     entry = stream_procs.pop(mount, None)
     dls_state.pop(mount, None)
     prev_error_counters.pop(mount, None)
+    # Clear any pending stream_watchdog retry for this mount too — otherwise
+    # a mux switch could leave a stale retry around that later tries to
+    # restart a service belonging to whatever mux used to be active.
+    failed_stream_restarts.pop(mount, None)
     if not entry:
         return
     p = entry.get("ffmpeg")
@@ -819,12 +869,53 @@ def stream_watchdog():
                 if info["ffmpeg"].poll() is not None
             ]
 
+        # Each restart is guarded individually. A burst of several streams
+        # dying close together (observed in production: a full mux restart
+        # followed by Icecast's own source-timeout killing nearly every
+        # freshly-started stream while welle-cli was still re-locking sync)
+        # meant start_stream_from_info() -> start_stream() -> Popen() only
+        # had to fail ONCE, for any transient reason, to raise straight out
+        # of this loop with no handler — silently killing this entire
+        # thread (same failure class as the v1.08/v1.09/v1.11 fixes). Every
+        # OTHER mount still in `dead`, and every future ffmpeg death for the
+        # rest of the process's life, would then never be restarted again —
+        # exactly what "needed a manual restart" looks like from outside.
         for mount, info in dead:
             logger_daemon.warning(f"Restarting dead stream: {mount}")
             with state_lock:
                 stream_procs.pop(mount, None)
                 dls_state.pop(mount, None)
-            start_stream_from_info(info["service"])
+            # Clear any older queued retry for this mount — the info we just
+            # captured from `dead` is more current.
+            failed_stream_restarts.pop(mount, None)
+            try:
+                start_stream_from_info(info["service"])
+            except Exception:
+                logger_daemon.exception(
+                    f"stream_watchdog: failed to restart {mount} — queued for retry "
+                    "instead of taking the whole watchdog down with it"
+                )
+                # A mount that fails here is already removed from
+                # stream_procs and start_stream() never got far enough to
+                # re-add it — without this, the mount simply vanishes with
+                # no process AND no watchdog entry left to ever notice it
+                # again. Queueing it here is what makes the retry actually
+                # happen on a later pass instead of just once.
+                failed_stream_restarts[mount] = info["service"]
+
+        # Retry anything that failed to restart on a previous pass. Kept
+        # separate from `dead` above because those mounts have no entry in
+        # stream_procs at all right now, so the poll()-based scan can't see
+        # them.
+        for mount, svc_info in list(failed_stream_restarts.items()):
+            logger_daemon.warning(f"stream_watchdog: retrying previously failed restart: {mount}")
+            try:
+                start_stream_from_info(svc_info)
+                failed_stream_restarts.pop(mount, None)
+            except Exception:
+                logger_daemon.exception(
+                    f"stream_watchdog: retry failed again for {mount} — will retry again next pass"
+                )
 
 def start_stream_from_info(svc_info):
     """Restart a stream given the cached service info dict."""
